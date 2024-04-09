@@ -1,0 +1,9 @@
+DROP TABLE superblocks;
+DROP TABLE superblocks_blocks;
+DROP TABLE blocks;
+DROP TABLE blocks_challenges;
+DROP TABLE challenges;
+DROP TABLE descriptions;
+DROP TABLE challenge_files;
+DROP TABLE instructions;
+DROP TABLE sentences;
