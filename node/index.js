@@ -2,18 +2,24 @@ import { writeFileSync, rmSync } from "fs";
 import apollo from "@apollo/client/core/core.cjs";
 import { createConnection } from "mysql";
 import { NodeHtmlMarkdown } from "node-html-markdown";
-import { query } from "./graphql-query.js";
-const { ApolloClient, InMemoryCache, gql } = apollo;
+import { allChallengeNode, allCertificateNode } from "./graphql-query.js";
+const { ApolloClient, InMemoryCache } = apollo;
 
-rmSync("../queries/node-log.sql", { force: true });
+const query_filename = ["create-tables", "insert", "drop-tables"];
+
+for (const filename of query_filename) {
+  rmSync(`../queries/${filename}.sql`, {
+    force: true,
+  });
+}
 
 const client = new ApolloClient({
   uri: "http://localhost:8000/__graphql",
   cache: new InMemoryCache(),
 });
 
-const data = await client.query({
-  query,
+const allChallengeData = await client.query({
+  query: allChallengeNode,
 });
 
 // console.log(JSON.stringify(data, null, 2));
@@ -21,6 +27,22 @@ const data = await client.query({
 const connection = createConnection("mysql://root:@127.0.0.1/curriculum");
 
 connection.connect();
+
+await seed();
+
+await createTables(allChallengeData.data.allChallengeNode.nodes);
+
+await addChallenges(allChallengeData.data.allChallengeNode.nodes);
+
+const allCertificateData = await client.query({
+  query: allCertificateNode,
+});
+
+await addCertifications(allCertificateData.data.allCertificateNode.nodes);
+
+await createDropTablesQueries();
+
+connection.end();
 
 function getTableName(key) {
   return key;
@@ -47,11 +69,11 @@ CREATE TABLE IF NOT EXISTS certifications(
   id INT NOT NULL AUTO_INCREMENT,
   title TEXT NOT NULL,
   object_id VARCHAR(24) NOT NULL,
-  slug TEXT,
+  dashed_name TEXT NOT NULL,
   state ENUM('current','upcomming','legacy') NOT NULL,
   PRIMARY KEY (id)
 );`;
-  await runSQL(sql);
+  await runCreateTable(sql);
 
   sql = `
 CREATE TABLE IF NOT EXISTS certifications_prerequisites(
@@ -60,6 +82,7 @@ CREATE TABLE IF NOT EXISTS certifications_prerequisites(
   PRIMARY KEY (certification_id, prerequisite_object_id),
   FOREIGN KEY (certification_id) REFERENCES certifications(id)
 );`;
+  await runCreateTable(sql);
 
   sql = `
 CREATE TABLE IF NOT EXISTS superblocks(
@@ -69,7 +92,7 @@ CREATE TABLE IF NOT EXISTS superblocks(
   superblock_order INT NOT NULL,
   PRIMARY KEY (id)
 );`;
-  await runSQL(sql);
+  await runCreateTable(sql);
 
   sql = `
 CREATE TABLE IF NOT EXISTS blocks(
@@ -78,7 +101,7 @@ CREATE TABLE IF NOT EXISTS blocks(
   dashed_name TEXT NOT NULL,
   PRIMARY KEY (id)
 );`;
-  await runSQL(sql);
+  await runCreateTable(sql);
 
   sql = `
 CREATE TABLE IF NOT EXISTS superblocks_blocks(
@@ -89,7 +112,7 @@ CREATE TABLE IF NOT EXISTS superblocks_blocks(
   FOREIGN KEY (superblock_id) REFERENCES superblocks(id),
   FOREIGN KEY (block_id) REFERENCES blocks(id)
 );`;
-  await runSQL(sql);
+  await runCreateTable(sql);
 
   sql = `
 CREATE TABLE IF NOT EXISTS challenges (
@@ -99,7 +122,7 @@ CREATE TABLE IF NOT EXISTS challenges (
   dashed_name TEXT NOT NULL,
   PRIMARY KEY (id)
 );`;
-  await runSQL(sql);
+  await runCreateTable(sql);
 
   sql = `
 CREATE TABLE IF NOT EXISTS blocks_challenges(
@@ -110,7 +133,7 @@ CREATE TABLE IF NOT EXISTS blocks_challenges(
   FOREIGN KEY (block_id) REFERENCES blocks(id),
   FOREIGN KEY (challenge_id) REFERENCES challenges(id)
 );`;
-  await runSQL(sql);
+  await runCreateTable(sql);
 }
 
 async function createTables(data) {
@@ -131,8 +154,17 @@ async function createTables(data) {
 
       description,
       time,
+      url,
+      required,
       ...challenge
     } = challengeNode.challenge;
+
+    // SPECIAL CASES
+    // Usually, because of reserved words in mysql
+    challenge.descriptions = description;
+    challenge.time_to_complete = time;
+    challenge.course_url = url;
+    challenge.required_resources = required;
 
     for (const [key, value] of Object.entries(challenge)) {
       // Filter out null values
@@ -163,18 +195,33 @@ CREATE TABLE IF NOT EXISTS ${tableName} (
       }
       if (!createdTables.includes(tableName)) {
         createdTables.push(tableName);
-        await runSQL(sql);
+        await runCreateTable(sql);
       }
     }
   }
 }
 
-await seed();
+async function addCertifications(data) {
+  let certification_id = 1;
+  for (const certificateNode of data) {
+    const { certification, id, tests, title } = certificateNode.challenge;
 
-// console.log(data.data.allChallengeNode.nodes);
-await createTables(data.data.allChallengeNode.nodes);
+    const sql = `INSERT INTO certifications (title, object_id, dashed_name, state) VALUES (?,?,?,?);`;
+    await insert(sql, [
+      title,
+      id,
+      certification,
+      title.includes("Legacy") ? "legacy" : "current",
+    ]);
+    for (const test of tests) {
+      const { id: test_id } = test;
+      const sql = `INSERT INTO certifications_prerequisites (certification_id, prerequisite_object_id) VALUES (?,?);`;
+      await insert(sql, [certification_id, test_id]);
+    }
 
-await addChallenges(data.data.allChallengeNode.nodes);
+    certification_id += 1;
+  }
+}
 
 async function addChallenges(data) {
   const superblockSet = new Set();
@@ -201,20 +248,29 @@ async function addChallenges(data) {
       __typename,
       description,
       time,
+      required,
+      url,
       challengeType,
       ...challenge
     } = challengeNode.challenge;
+
+    // SPECIAL CASES
+    challenge.descriptions = description;
+    challenge.time_to_complete = time;
+    challenge.course_url = url;
+    challenge.required_resources = required;
+
     if (!superblockSet.has(superBlock)) {
-      sql = `INSERT INTO superblocks (title, dashed_name, superblock_order) VALUES ('${superBlock}', '${superBlock}', ${superOrder});`;
-      await runSQL(sql);
+      sql = `INSERT INTO superblocks (title, dashed_name, superblock_order) VALUES (?,?,?);`;
+      await insert(sql, [superBlock, superBlock, superOrder]);
       superblockSet.add(superBlock);
       superblock_to_superblock_id_map.set(superBlock, superblock_id);
       superblock_id += 1;
     }
 
     if (!blockSet.has(block)) {
-      sql = `INSERT INTO blocks (title, dashed_name) VALUES ('${block}', '${block}');`;
-      await runSQL(sql);
+      sql = `INSERT INTO blocks (title, dashed_name) VALUES (?,?);`;
+      await insert(sql, [block, block]);
       blockSet.add(block);
       block_to_block_id_map.set(block, block_id);
       block_id += 1;
@@ -229,14 +285,14 @@ async function addChallenges(data) {
     ) {
       const superblockId = superblock_to_superblock_id_map.get(superBlock);
       const blockId = block_to_block_id_map.get(block);
-      sql = `INSERT INTO superblocks_blocks (superblock_id, block_id, block_order) VALUES (${superblockId}, ${blockId}, ${order});`;
-      await runSQL(sql);
+      sql = `INSERT INTO superblocks_blocks (superblock_id, block_id, block_order) VALUES (?,?,?);`;
+      await insert(sql, [superblockId, blockId, order]);
     }
 
     if (block_to_block_id_map.get(block)) {
       const blockId = block_to_block_id_map.get(block);
-      sql = `INSERT INTO blocks_challenges (block_id, challenge_id, challenge_order) VALUES (${blockId}, ${c}, ${challengeOrder});`;
-      await runSQL(sql);
+      sql = `INSERT INTO blocks_challenges (block_id, challenge_id, challenge_order) VALUES (?,?,?);`;
+      await insert(sql, [blockId, c, challengeOrder]);
     }
 
     // Add to feature tables
@@ -280,16 +336,12 @@ async function addChallenges(data) {
   }
 }
 
-connection.end();
-
 async function runSQL(sql) {
-  writeFileSync("../queries/node-log.sql", "\n" + sql + "\n", { flag: "as" });
-  return new Promise((resolve, reject) => {
-    connection.query(sql, (err, result) => {
+  return new Promise((resolve, _reject) => {
+    connection.query(sql, (err, _result) => {
       if (err) {
+        console.error("Error running SQL:\n", sql);
         throw err;
-      } else {
-        // console.log(result);
       }
       resolve();
     });
@@ -297,12 +349,47 @@ async function runSQL(sql) {
 }
 
 async function insert(sql, values) {
+  // TODO: This is not useful without the values included
+  // writeFileSync(`../queries/insert.sql`, "\n" + sql + "\n", {
+  //   flag: "a",
+  // });
   return new Promise((resolve, reject) => {
     connection.query(sql, values, (err, result) => {
       if (err) {
+        console.error("Error running SQL:\n", sql);
+        console.error("\n... with values:\n", values);
         throw err;
-      } else {
-        // console.log(result);
+      }
+      resolve();
+    });
+  });
+}
+
+async function runCreateTable(sql) {
+  writeFileSync(`../queries/create-tables.sql`, "\n" + sql + "\n", {
+    flag: "a",
+  });
+  await runSQL(sql);
+}
+
+/**
+ * NOTE: The order of the tables is important, and NOT taken into account here.
+ *       Tables with refs should be dropped first.
+ */
+async function createDropTablesQueries() {
+  const sql = `show tables;`;
+  return new Promise((resolve, reject) => {
+    connection.query(sql, (err, result) => {
+      if (err) {
+        console.error("Error running SQL:\n", sql);
+        throw err;
+      }
+      for (const row of result) {
+        const { Tables_in_curriculum } = row;
+        const sql = `DROP TABLE IF EXISTS ${Tables_in_curriculum};`;
+        writeFileSync(`../queries/drop-tables.sql`, sql + "\n", {
+          flag: "a",
+        });
       }
       resolve();
     });

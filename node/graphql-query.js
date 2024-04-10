@@ -1,8 +1,8 @@
 import { gql } from "@apollo/client/core/core.cjs";
 
-export const query = gql`
+export const allChallengeNode = gql`
   query MyQuery {
-    allChallengeNode(limit: 1000) {
+    allChallengeNode {
       nodes {
         challenge {
           assignments
@@ -144,6 +144,25 @@ export const query = gql`
           }
           videoUrl
         }
+      }
+    }
+  }
+`;
+
+export const allCertificateNode = gql`
+  query MyQuery {
+    allCertificateNode {
+      nodes {
+        challenge {
+          certification
+          id
+          tests {
+            id
+            title
+          }
+          title
+        }
+        id
       }
     }
   }
